@@ -1,6 +1,7 @@
 -- ssass_boot.lua: flash onto the EEPROM of every SSASS unit computer (case + CPU + RAM + EEPROM +
 -- tier 2 wireless card, nothing else). Downloads ssass_node.lua from the brain and runs it; on any
 -- error it reports to the brain and starts over 5 s later.
+if not component then error("this is the unit EEPROM program. To set the target run: /home/ssass_brain.lua <target>", 0) end
 local m = component.proxy(component.list("modem")())
 local P = 4211
 m.open(P)
