@@ -32,7 +32,7 @@ for i = 1, #code, 4000 do parts[#parts + 1] = code:sub(i, i + 3999) end -- packe
 local modem = component.modem
 modem.open(PORT)
 modem.setStrength(400)
-print(("target %d L per SSASS (%d L per hatch)"):format(target, target // 16))
+print(("target %d L per SSASS (%d L per hatch). Press q or Ctrl+C to stop."):format(target, target // 16))
 
 local nextT = 0
 while true do
@@ -40,8 +40,12 @@ while true do
     modem.broadcast(PORT, "T", target)
     nextT = computer.uptime() + 2
   end
-  local ev, _, from, port, _, kind, a, b, c, d = event.pull(1, "modem_message")
-  if ev and port == PORT then
+  local ev, _, from, port, _, kind, a, b, c, d = event.pull(1)
+  if ev == "interrupted" or ev == "key_down" and from == string.byte("q") then
+    print("stopped. Units hold their level until the brain runs again.")
+    return
+  end
+  if ev == "modem_message" and port == PORT then
     local who = from:sub(1, 8)
     if kind == "get" then
       for i, p in ipairs(parts) do modem.send(from, PORT, "code", i, #parts, p) end
