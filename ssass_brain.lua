@@ -40,7 +40,7 @@ while true do
     modem.broadcast(PORT, "T", target)
     nextT = computer.uptime() + 2
   end
-  local ev, _, from, port, _, kind, a, b, c, d = event.pull(1)
+  local ev, _, from, port, _, kind, a, b, c, d, e = event.pull(1)
   if ev == "interrupted" or ev == "key_down" and from == string.byte("q") then
     print("stopped. Units hold their level until the brain runs again.")
     return
@@ -51,8 +51,8 @@ while true do
       for i, p in ipairs(parts) do modem.send(from, PORT, "code", i, #parts, p) end
       print(who .. " booted")
     elseif kind == "status" then
-      print(("%s  %d L/hatch = %d L (target %d), spare %d L, ME ran dry %d times")
-        :format(who, a, a * 16, b, c, d))
+      print(("%s  %d L/hatch = %d L (target %d), spare %d L, ME ran dry %d times: %s")
+        :format(who, a, a * 16, b, c, d, tostring(e)))
     elseif kind == "err" then
       print(who .. " error: " .. tostring(a))
     end

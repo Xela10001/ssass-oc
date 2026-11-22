@@ -66,6 +66,7 @@ local master, masterAddr, lastL, target, lastT, maxL = false, nil, nil, nil, -ma
 local bank, produced, absd, noise, dry, dryCount, dryUntil, cycles = 0, 0, 0, 0, false, 0, 0, 0
 local lastCycle, lastQuiet, lastBeat, statusDue, sinceL = -math.huge, uptime(), 0, false, math.huge
 local reported, tankMin, tanks, nextTank = true, 0, {}, 0 -- lowest interface tank; master: per unit
+local why = "starting"
 
 local function setLevel(v)
   if v ~= L then sinceL = uptime() end
@@ -105,6 +106,13 @@ local function onCycle()
     poorest = poorest - 2 * SHARE * math.max(0, L - (before or L))
     local up = math.min(step, math.floor(poorest / SHARE - 3 * noise / 16))
     if L < 1 then up = 1 end -- an empty forge makes nothing; 1 L in whichever hatches can get it starts it
+    -- why the level isn't rising, for the brain's status line
+    if not (target and now - lastT < 30) then why = "holding: no target from the brain"
+    elseif L >= maxL then why = "at target"
+    elseif up <= 0 then why = ("waiting for interface tanks (poorest %d L)"):format(math.max(0, poorest))
+    elseif bank - reserve < 16 then why = ("saving production (%d of %d L)"):format(bank, reserve + 16)
+    else why = "rising" end
+    if dry and cycles >= dryUntil then why = "a hatch was short: lowering to refill ME" end
     if dry and cycles >= dryUntil then
       -- ME ran dry (the float was taken, or a power loss voided 10%): the level is no longer funded
       -- and every short fill costs the imbalance penalty. Drop it once so the drains rebuild the float;
@@ -204,7 +212,7 @@ while true do
       end
       if statusDue and brain then
         modem.setStrength(400)
-        modem.send(brain, WPORT, "status", L, maxL and maxL * 16 or -1, bank, dryCount, #hatches)
+        modem.send(brain, WPORT, "status", L, maxL and maxL * 16 or -1, bank, dryCount, why)
         modem.setStrength(0)
         statusDue = false
       end
