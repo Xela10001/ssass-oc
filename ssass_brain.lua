@@ -40,15 +40,15 @@ while true do
     modem.broadcast(PORT, "T", target)
     nextT = computer.uptime() + 2
   end
-  local ev, _, from, port, _, kind, a, b, c, d, e = event.pull(1, "modem_message")
+  local ev, _, from, port, _, kind, a, b, c, d = event.pull(1, "modem_message")
   if ev and port == PORT then
     local who = from:sub(1, 8)
     if kind == "get" then
       for i, p in ipairs(parts) do modem.send(from, PORT, "code", i, #parts, p) end
       print(who .. " booted")
     elseif kind == "status" then
-      print(("%s  %d L/hatch = %d L (target %d), ME float %d L, dry %d, %d hatches on master")
-        :format(who, a, a * 16, b, c, d, e))
+      print(("%s  %d L/hatch = %d L (target %d), spare %d L, ME ran dry %d times")
+        :format(who, a, a * 16, b, c, d))
     elseif kind == "err" then
       print(who .. " error: " .. tostring(a))
     end

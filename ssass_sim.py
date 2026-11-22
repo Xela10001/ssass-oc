@@ -27,10 +27,50 @@ def src(name):
     return open(os.path.join(HERE, name), encoding="utf-8").read()
 
 
+class DualInterface:
+    """AE2FC DualityFluidInterface with antimatter in one config slot, ticked like AE2's TickManagerCache.
+
+    A fill (hatch -> interface) goes straight into the ME network. A drain (interface -> hatch) comes from a
+    16,000 L tank. The interface tops the tank up on its grid tick: success sets the tick interval to the
+    minimum (5), failure (ME empty) adds 1 up to 120, a full tank sleeps, and a drain wakes a sleeping one
+    for the next tick."""
+
+    TANK, MIN, MAX = 16000, 5, 120
+
+    def __init__(self, world):
+        self.world = world
+        self.tank, self.rate, self.last, self.awake = 0, (self.MIN + self.MAX) // 2, 0, True
+
+    def grid_tick(self):
+        w = self.world
+        if not self.awake or w.tick - self.last < self.rate:
+            return
+        got = min(self.TANK - self.tank, w.me)
+        if got > 0:
+            self.tank += got
+            w.me -= got
+            self.rate = self.MIN
+        else:
+            self.rate = min(self.MAX, self.rate + 1)
+        self.last = w.tick
+        if self.tank >= self.TANK:
+            self.awake = False
+
+    def drain(self, n):
+        n = min(n, self.tank)
+        if n > 0:
+            self.tank -= n
+            if not self.awake:  # alertDevice: tick on the next grid tick
+                self.awake, self.rate, self.last = True, self.MIN, self.world.tick - self.MAX
+        return n
+
+
 class Forge:
-    def __init__(self, world, start, C, A):
+    def __init__(self, world, start, C, A, per_iface):
         self.world, self.C, self.A = world, C, A
         self.h = [start] * 16
+        self.ifaces = [DualInterface(world) for _ in range(16 // per_iface)]
+        self.iface_of = [self.ifaces[i // per_iface] for i in range(16)]
         self.phase = random.randrange(20)
         self.relay = []  # [ready_tick, sender, to, port, payload]
         self.relay_next = 0
@@ -44,7 +84,9 @@ class Forge:
         if self.crash_at is not None and w.tick >= self.crash_at:
             self.crash_at = None
             self.h = [a - a // 10 for a in self.h]  # power loss voids 10%
-            w.me = 0  # ...and someone emptied ME
+            w.me = 0  # ...and someone emptied ME, interface tanks included
+            for x in self.ifaces:
+                x.tank = 0
         total, lo, hi = sum(self.h), min(self.h), max(self.h)
         self.log.append((w.tick // 20, lo, hi))
         if hi != lo and w.tick > w.settle:
@@ -115,7 +157,7 @@ function(py, code, arg, openos)
     kinds[addr] = "transposer"
     proxies[addr] = {
       getTankCapacity = function(s) sync() return py.cap(s) end,
-      getTankLevel = function(s) sync() return py.level(i) end,
+      getTankLevel = function(s) sync() return py.level(i, s) end,
       getFluidTransferRate = function() sync() return py.rate end,
       transferFluid = function(f, t, n)
         sync()
@@ -191,14 +233,13 @@ class Computer(Endpoint):
         def transfer(i, frm, n):
             h = ep.forge.h
             n = int(n)
-            if frm == 2:  # hatch -> ME
+            if frm == 2:  # hatch -> interface -> straight into ME
                 n = min(n, h[i])
                 h[i] -= n
                 w.me += n
-            else:
-                n = min(n, w.me, CAP - h[i])
+            else:  # interface tank -> hatch
+                n = ep.forge.iface_of[i].drain(min(n, CAP - h[i]))
                 h[i] += n
-                w.me -= n
             delay = n / ep.rate - 0.05
             return n > 0, n, (math.ceil(delay * 20) if delay > 0 else 0)
 
@@ -206,8 +247,8 @@ class Computer(Endpoint):
             "ids": lua.table_from(self.ids),
             "addr": self.addr,
             "rate": self.rate,
-            "level": lambda i: ep.forge.h[i],
-            "cap": lambda side: CAP if side == 2 else (64_000_000 if side == 3 else None),
+            "level": lambda i, side: ep.forge.h[i] if side == 2 else ep.forge.iface_of[i].tank,
+            "cap": lambda side: CAP if side == 2 else (DualInterface.TANK if side == 3 else None),
             "transfer": transfer,
             "open": lambda p: ep.ports.add(p),
             "strength": lambda s: setattr(ep, "strength", s),
@@ -238,8 +279,10 @@ class World:
             self.brain.arg = str(target)
             self.brain.start()
 
-    def add_forge(self, start, C=0.0, A=0.0, rate=LUV, per_unit=4):
-        f = Forge(self, start, C, A)
+    def add_forge(self, start, C=0.0, A=0.0, rate=LUV, per_unit=4, per_iface=2):
+        f = Forge(self, start, C, A, per_iface)
+        for x in f.ifaces:  # interfaces stock up from ME before anything starts
+            x.grid_tick()
         boot = src("ssass_boot.lua")
         for k in range(0, 16, per_unit):
             addr = f"{random.getrandbits(32):08x}-unit"
@@ -261,6 +304,10 @@ class World:
                 c.step()
             if not forge_first:
                 self.cycle_forges()
+            ifaces = [x for f in self.forges for x in f.ifaces]
+            random.shuffle(ifaces)  # AE2 grid ticks; who restocks first depends on the queue
+            for x in sorted(ifaces, key=lambda x: x.last + x.rate):
+                x.grid_tick()
         self.tick += 1
 
     def cycle_forges(self):
@@ -301,10 +348,11 @@ if __name__ == "__main__":
 
     random.seed(7)
     w, a, b = stage4(RELAY_STOCK)
-    print("stock relay (no CPU/RAM):", *[f"imbalanced {f.imbalanced}, penalty {f.penalty / f.made:.1%}"
-                                         for f in (a, b)], sep="  ")
+    print("stock relay (no CPU/RAM in it), for comparison:",
+          *[f"imbalanced {f.imbalanced}, penalty {f.penalty / f.made:.1%}" for f in (a, b)], sep="  ")
 
-    # Ramp: empty forge, 64 L seeded in ME, no stabilizers, target 160,000 L.
+    # Ramp: empty forge, 64 L seeded in ME, no stabilizers, target 160,000 L, 8 shared interfaces.
+    random.seed(1)
     w = World(me=64, settle=0)
     w.start_brain(160_000)
     f = w.add_forge(0)
@@ -314,6 +362,7 @@ if __name__ == "__main__":
     assert sum(f.h) > 16_000 and f.penalty < 0.05 * f.made, "ramp must grow without paying the penalty"
 
     # Hold 8,000 L; at 700 s a power loss voids 10% and ME is emptied. Must climb back, not spiral to 0.
+    random.seed(1)
     w = World(me=64, settle=0)
     w.start_brain(8000)
     f = w.add_forge(0)
@@ -321,4 +370,13 @@ if __name__ == "__main__":
     w.run(1100)
     lo, hi = last_level(f)
     print(f"crash at 700 s: {lo}..{hi} L/hatch at 1100 s (target {8000 // 16}), ME {w.me} L")
-    assert lo == hi == 8000 // 16 and w.me > 0, "must rebuild the ME float and return to the target"
+    assert lo == hi == 8000 // 16, "must rebuild the float and return to the target"
+
+    # Your kickstart: 17 L in ME, 8 dual interfaces shared by 2 hatches each, target 400,000 L.
+    random.seed(1)
+    w = World(me=17, settle=0)
+    w.start_brain(400_000)
+    f = w.add_forge(0)
+    w.run(1200)
+    print(f"kickstart from 17 L: {sum(f.h)} L after 20 min, penalty {f.penalty / f.made:.1%} of production")
+    assert sum(f.h) > 10_000 and f.penalty < 0.05 * f.made, "must start from 17 L"
