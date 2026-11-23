@@ -66,7 +66,7 @@ for _, x in ipairs(hatches) do
   else
     local ok, n = x.t.transferFluid(x.me, x.h, 1)
     if not ok or n < 1 then
-      note(x.id .. ": can't fill its hatch. Screwdriver the hatch so its front accepts input.")
+      note(x.id .. ": can't fill its hatch. The screwdriver TOGGLES front input: click until chat says 'Front face input enabled'.")
     else
       ok, n = x.t.transferFluid(x.h, x.me, 1)
       if not ok or n < 1 then note(x.id .. ": can't drain its hatch. The transposer must touch the hatch's FRONT face.") end
