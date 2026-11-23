@@ -249,6 +249,7 @@ while true do
       if statusDue and brain then
         modem.setStrength(400)
         modem.send(brain, WPORT, "status", L, maxL and maxL * 16 or -1, bank, dryCount, why)
+        dryCount = 0 -- report drops per status period, not since boot
         modem.setStrength(0)
         statusDue = false
       end
