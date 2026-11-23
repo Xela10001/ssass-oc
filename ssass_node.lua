@@ -32,21 +32,50 @@ local function nextLevel(L, maxL, bank, reserve, up, down)
   return newL, bank
 end
 
+-- tell the brain something worth a human's attention (costs 3 ticks; keep it rare)
+local function note(msg)
+  if not brain then return end
+  modem.setStrength(400)
+  modem.send(brain, WPORT, "note", msg)
+  modem.setStrength(0)
+end
+
 local hatches = {}
 for addr in component.list("transposer") do
   local t = component.proxy(addr)
-  local x = { t = t }
+  local x = { t = t, id = addr:sub(1, 8) }
+  local found = 0
   for side = 0, 5 do
     local cap = t.getTankCapacity(side)
-    if cap == HATCH_CAP then x.h = side elseif type(cap) == "number" and cap > 0 then x.me = side end
+    if cap == HATCH_CAP then x.h, found = side, found + 1
+    elseif type(cap) == "number" and cap > 0 then x.me = side end
   end
   if not (x.h and x.me) then
-    error("transposer " .. addr:sub(1, 8) .. " needs an antimatter hatch front and an ME dual interface next to it")
+    error("transposer " .. x.id .. " needs an antimatter hatch front and an ME dual interface next to it")
   end
-  x.last = t.getTankLevel(x.h)
+  if found > 1 then error("transposer " .. x.id .. " touches " .. found .. " antimatter hatches; it must touch only one") end
   hatches[#hatches + 1] = x
 end
 if #hatches == 0 then error("no transposers on this computer's cable") end
+
+-- Test every hatch once: 1 L in from the interface, 1 L back out. Filling works through any face of a
+-- screwdrivered hatch, draining only through its front.
+for _, x in ipairs(hatches) do
+  if x.t.getTankLevel(x.me) < 1 then
+    note(x.id .. ": its ME dual interface has no antimatter yet. If that stays, set antimatter in one of its fluid slots.")
+  else
+    local ok, n = x.t.transferFluid(x.me, x.h, 1)
+    if not ok or n < 1 then
+      note(x.id .. ": can't fill its hatch. Screwdriver the hatch so its front accepts input.")
+    else
+      ok, n = x.t.transferFluid(x.h, x.me, 1)
+      if not ok or n < 1 then note(x.id .. ": can't drain its hatch. The transposer must touch the hatch's FRONT face.") end
+    end
+  end
+  x.last = x.t.getTankLevel(x.h)
+end
+note(("runs %d hatches"):format(#hatches)
+  .. (#hatches ~= 4 and ". WARNING: expected 4. Cables of different unit computers must not touch." or ""))
 
 -- A transfer pauses the computer once it moves more than 1/20 of the transposer's rate. Level steps
 -- use half of that, leaving the other half for the per-cycle noise.
@@ -66,7 +95,7 @@ local master, masterAddr, lastL, target, lastT, maxL = false, nil, nil, nil, -ma
 local bank, produced, absd, noise, dry, dryCount, dryUntil, cycles = 0, 0, 0, 0, false, 0, 0, 0
 local lastCycle, lastQuiet, lastBeat, statusDue, sinceL = -math.huge, uptime(), 0, false, math.huge
 local reported, tankMin, tanks, nextTank = true, 0, {}, 0 -- lowest interface tank; master: per unit
-local why = "starting"
+local why, lastShort = "starting", -math.huge
 
 local function setLevel(v)
   if v ~= L then sinceL = uptime() end
@@ -86,7 +115,14 @@ local function onCycle()
   -- level change: the fills may not have had a full window.
   if L and now - sinceL > 1.5 then
     for _, x in ipairs(hatches) do
-      if x.last < L - 1 then dry = true end
+      if x.last < L - 1 then
+        dry = true
+        if now - lastShort > 10 then
+          lastShort = now
+          note(("%s: hatch short at the cycle start (%d of %d L), its interface holds %d L")
+            :format(x.id, x.last, L, x.tank or -1))
+        end
+      end
     end
   end
   local before = L

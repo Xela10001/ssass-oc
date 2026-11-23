@@ -53,6 +53,8 @@ while true do
     elseif kind == "status" then
       print(("%s  %d L/hatch = %d L (target %d), spare %d L, ME ran dry %d times: %s")
         :format(who, a, a * 16, b, c, d, tostring(e)))
+    elseif kind == "note" then
+      print(who .. "  " .. tostring(a))
     elseif kind == "err" then
       print(who .. " error: " .. tostring(a))
     end
