@@ -51,7 +51,7 @@ while true do
       for i, p in ipairs(parts) do modem.send(from, PORT, "code", i, #parts, p) end
       print(who .. " booted")
     elseif kind == "status" then
-      print(("%s  %d L/hatch = %d L (target %d), spare %d L, short-hatch drops in last 30 s: %d, %s")
+      print(("%s  %d L/hatch = %d L (target %d), spare in private tanks %d L, short-hatch drops in last 30 s: %d, %s")
         :format(who, a, a * 16, b, c, d, tostring(e)))
     elseif kind == "note" then
       print(who .. "  " .. tostring(a))

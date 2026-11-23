@@ -66,9 +66,12 @@ class DualInterface:
 
 
 class Forge:
+    PTANK = 4_000_000  # Super Tank I
+
     def __init__(self, world, start, C, A, per_iface):
         self.world, self.C, self.A = world, C, A
         self.h = [start] * 16
+        self.ptank = [0] * 16  # each transposer's private tank
         self.ifaces = [DualInterface(world) for _ in range(16 // per_iface)]
         self.iface_of = [self.ifaces[i // per_iface] for i in range(16)]
         self.phase = random.randrange(20)
@@ -84,9 +87,10 @@ class Forge:
         if self.crash_at is not None and w.tick >= self.crash_at:
             self.crash_at = None
             self.h = [a - a // 10 for a in self.h]  # power loss voids 10%
-            w.me = 0  # ...and someone emptied ME, interface tanks included
+            w.me = 0  # ...and someone emptied ME, interface tanks and private tanks included
             for x in self.ifaces:
                 x.tank = 0
+            self.ptank = [0] * 16
         total, lo, hi = sum(self.h), min(self.h), max(self.h)
         self.log.append((w.tick // 20, lo, hi))
         if hi != lo and w.tick > w.settle:
@@ -161,7 +165,7 @@ function(py, code, arg, openos)
       getFluidTransferRate = function() sync() return py.rate end,
       transferFluid = function(f, t, n)
         sync()
-        local ok, moved, pause = py.transfer(i, f, n)
+        local ok, moved, pause = py.transfer(i, f, t, n)
         for _ = 1, pause do Y() end
         return ok, moved
       end,
@@ -230,16 +234,28 @@ class Computer(Endpoint):
         lua = lua53.LuaRuntime(unpack_returned_tuples=True)
         pause = [0]
 
-        def transfer(i, frm, n):
-            h = ep.forge.h
+        HATCH, IFACE, PTANK = 2, 3, 4  # transposer sides
+
+        def transfer(i, frm, to, n):
+            f = ep.forge
             n = int(n)
-            if frm == 2:  # hatch -> interface -> straight into ME
-                n = min(n, h[i])
-                h[i] -= n
+            # how much the source can give
+            avail = {HATCH: f.h[i], IFACE: f.iface_of[i].tank, PTANK: f.ptank[i]}.get(frm, 0)
+            # how much the sink takes; the interface injects straight into ME, without limit
+            room = {HATCH: CAP - f.h[i], IFACE: n, PTANK: Forge.PTANK - f.ptank[i]}.get(to, 0)
+            n = max(0, min(n, avail, room))
+            if frm == HATCH:
+                f.h[i] -= n
+            elif frm == IFACE:
+                n = f.iface_of[i].drain(n)
+            else:
+                f.ptank[i] -= n
+            if to == HATCH:
+                f.h[i] += n
+            elif to == IFACE:
                 w.me += n
-            else:  # interface tank -> hatch
-                n = ep.forge.iface_of[i].drain(min(n, CAP - h[i]))
-                h[i] += n
+            else:
+                f.ptank[i] += n
             delay = n / ep.rate - 0.05
             return n > 0, n, (math.ceil(delay * 20) if delay > 0 else 0)
 
@@ -247,8 +263,9 @@ class Computer(Endpoint):
             "ids": lua.table_from(self.ids),
             "addr": self.addr,
             "rate": self.rate,
-            "level": lambda i, side: ep.forge.h[i] if side == 2 else ep.forge.iface_of[i].tank,
-            "cap": lambda side: CAP if side == 2 else (DualInterface.TANK if side == 3 else None),
+            "level": lambda i, side: {HATCH: ep.forge.h[i], IFACE: ep.forge.iface_of[i].tank,
+                                      PTANK: ep.forge.ptank[i]}.get(side, 0),
+            "cap": lambda side: {HATCH: CAP, IFACE: DualInterface.TANK, PTANK: Forge.PTANK}.get(side),
             "transfer": transfer,
             "open": lambda p: ep.ports.add(p),
             "strength": lambda s: setattr(ep, "strength", s),
@@ -342,7 +359,8 @@ if __name__ == "__main__":
         print(f"stage 4 {name}: imbalanced {f.imbalanced}/{len(f.log)} cycles after 12 s, penalty "
               f"{f.penalty / f.made:.1%} of production, last cycle {lo}..{hi} L/hatch (target {60_000_000 // 16})")
         assert lo == hi == 60_000_000 // 16, "must settle exactly on the new target"
-        assert f.penalty < 0.03 * f.made, "imbalance penalty must stay small"
+        # A's master reboots at 150 s: its 4 hatches drift for ~4 cycles while it boots and self-tests
+        assert f.penalty < (0.05 if f is a else 0.01) * f.made, "imbalance penalty must stay small"
     print("  brain log:", *[l for l in w.logs if "error" in l or "L/hatch" in l][:4], sep="\n    ")
     assert not [l for l in w.logs if "error" in l], "no unit may crash"
 
@@ -380,3 +398,18 @@ if __name__ == "__main__":
     w.run(1200)
     print(f"kickstart from 17 L: {sum(f.h)} L after 20 min, penalty {f.penalty / f.made:.1%} of production")
     assert sum(f.h) > 10_000 and f.penalty < 0.05 * f.made, "must start from 17 L"
+
+    # The collapse seen in game: 1,755 L/hatch, ME empty, seven interfaces holding ~4,000 L and one
+    # starved at 0 (AE2 keeps feeding the others), private tanks just placed and empty. Target 100,000 L.
+    for seed in (1, 2, 3):
+        random.seed(seed)
+        w = World(me=0, settle=0)
+        w.start_brain(100_000)
+        f = w.add_forge(1755)
+        for k, x in enumerate(f.ifaces):
+            x.tank = 0 if k == 7 else 4000
+        lows = []
+        w.run(900, [(t, lambda: lows.append(min(f.h))) for t in range(60, 900, 30)])
+        print(f"starved interface, seed {seed}: lowest level after 1 min {min(lows)} L/hatch, "
+              f"{sum(f.h)} L after 15 min, penalty {f.penalty / f.made:.1%}, starved interface {f.ifaces[7].tank} L")
+        assert min(lows) > 1000 and sum(f.h) > 28_000, "a starved interface must not collapse the level"

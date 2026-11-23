@@ -4,11 +4,15 @@
 -- downloads this file from the brain computer (ssass_brain.lua), which also broadcasts the target.
 -- Each computer balances the transposers on its own cable. The 4 cables meet at a Relay, which passes
 -- messages but not components; the lowest-addressed computer is the master and picks the level.
+--
+-- Every transposer touches three things: its hatch's front, its own private tank, and an ME dual
+-- interface. A hatch's excess is drained into its private tank and its fills come from there, so no
+-- other hatch can take that antimatter. The interface is the overflow (it injects straight into ME) and
+-- the backup source. AE2 alone decides which interface gets ME's antimatter, and it can starve one.
 
 local brain = ...
 local PORT, WPORT = 4210, 4211 -- unit traffic (cable, through the relay), brain traffic (wireless)
 local HATCH_CAP = 16384000
-local SHARE = 2 -- at most this many hatches draw from one ME dual interface
 
 local uptime = computer.uptime
 local born = uptime()
@@ -17,20 +21,6 @@ local self = modem.address
 modem.open(PORT)
 modem.open(WPORT)
 modem.setStrength(0) -- unit traffic must stay on the cable, or every other SSASS would hear it
-
--- Master's level rule. bank = production not yet turned into level (L, all hatches together), i.e.
--- spare antimatter in ME. Keep `reserve` of it so fills never wait on another computer's drains,
--- spend the rest on raising the level, lower the level if a deficit eats through the reserve, rise
--- by at most `up` and fall by at most `down` per hatch per cycle. At the target, surplus is output.
-local function nextLevel(L, maxL, bank, reserve, up, down)
-  local inc = math.floor((bank - reserve) / 16)
-  if inc < 0 and bank >= -reserve then inc = 0 end
-  local want = math.min(maxL, math.max(1, L + inc))
-  local newL = math.max(L - down, math.min(L + math.max(0, up), want))
-  bank = bank - 16 * (newL - L)
-  if newL >= maxL then bank = math.min(bank, reserve) end
-  return newL, bank
-end
 
 -- tell the brain something worth a human's attention (costs 3 ticks; keep it rare)
 local function note(msg)
@@ -44,63 +34,104 @@ local hatches = {}
 for addr in component.list("transposer") do
   local t = component.proxy(addr)
   local x = { t = t, id = addr:sub(1, 8) }
-  local found = 0
+  local found, others = 0, {}
   for side = 0, 5 do
     local cap = t.getTankCapacity(side)
     if cap == HATCH_CAP then x.h, found = side, found + 1
-    elseif type(cap) == "number" and cap > 0 then x.me = side end
+    elseif type(cap) == "number" and cap > 0 then others[#others + 1] = { side, cap } end
   end
-  if not (x.h and x.me) then
-    error("transposer " .. x.id .. " needs an antimatter hatch front and an ME dual interface next to it")
+  if found ~= 1 then
+    error("transposer " .. x.id .. " must touch exactly one antimatter hatch front, it touches " .. found)
   end
-  if found > 1 then error("transposer " .. x.id .. " touches " .. found .. " antimatter hatches; it must touch only one") end
+  if #others ~= 2 then
+    error("transposer " .. x.id .. " must touch its hatch, an ME dual interface and its own private tank; it touches "
+      .. #others .. " tanks besides the hatch")
+  end
+  table.sort(others, function(a, b) return a[2] < b[2] end) -- interface: 16,000 L; private tank: millions
+  x.me, x.tk = others[1][1], others[2][1]
   hatches[#hatches + 1] = x
 end
 if #hatches == 0 then error("no transposers on this computer's cable") end
 
--- Test every hatch once: 1 L in from the interface, 1 L back out. Filling works through any face of a
--- screwdrivered hatch, draining only through its front.
+local function xfer(x, from, to, n)
+  if n <= 0 then return 0 end
+  local ok, m = x.t.transferFluid(from, to, n)
+  return ok and m or 0
+end
+
+-- Test every hatch once: 1 L into the hatch, from the hatch into its private tank, and from the
+-- tank into the interface. Filling works through any face of a screwdrivered hatch, draining only
+-- through its front; the private tank refuses input on its own front.
 for _, x in ipairs(hatches) do
-  if x.t.getTankLevel(x.me) < 1 then
-    note(x.id .. ": its ME dual interface has no antimatter yet. If that stays, set antimatter in one of its fluid slots.")
-  else
-    local ok, n = x.t.transferFluid(x.me, x.h, 1)
-    if not ok or n < 1 then
-      note(x.id .. ": can't fill its hatch. The screwdriver TOGGLES front input: click until chat says 'Front face input enabled'.")
-    else
-      ok, n = x.t.transferFluid(x.h, x.me, 1)
-      if not ok or n < 1 then note(x.id .. ": can't drain its hatch. The transposer must touch the hatch's FRONT face.") end
-    end
+  local src = (x.t.getTankLevel(x.tk) >= 1 and x.tk) or (x.t.getTankLevel(x.me) >= 1 and x.me)
+  if not src then
+    note(x.id .. ": no antimatter in its private tank or ME dual interface yet; it can't be tested until there is")
+  elseif xfer(x, src, x.h, 1) < 1 then
+    note(x.id .. ": can't fill its hatch. The screwdriver TOGGLES front input: click until chat says 'Front face input enabled'.")
+  elseif xfer(x, x.h, x.tk, 1) < 1 then
+    note(x.id .. ": can't drain its hatch into its private tank. The transposer must touch the hatch's FRONT, "
+      .. "and the tank's front (output face) must not face the transposer.")
+  elseif xfer(x, x.tk, x.me, 1) < 1 then
+    note(x.id .. ": can't move antimatter from its private tank into its ME dual interface.")
   end
+  x.tank = x.t.getTankLevel(x.tk)
   x.last = x.t.getTankLevel(x.h)
 end
 note(("runs %d hatches"):format(#hatches)
   .. (#hatches ~= 4 and ". WARNING: expected 4. Cables of different unit computers must not touch." or ""))
 
 -- A transfer pauses the computer once it moves more than 1/20 of the transposer's rate. Level steps
--- use half of that, leaving the other half for the per-cycle noise.
+-- and tank housekeeping use half of that, leaving the other half for the per-cycle noise.
 local step = math.max(1, math.floor(hatches[1].t.getFluidTransferRate() / 40))
 
--- signed move: > 0 drains the hatch into ME, < 0 fills it from ME; returns the signed amount moved
+local function refused(x)
+  if uptime() - (x.warned or -math.huge) < 10 then return end
+  x.warned = uptime()
+  note(("%s: HATCH REFUSED A FILL with %d L in its private tank. Its front input got switched off: "
+    .. "screwdriver it until chat says 'Front face input enabled', and keep its GUI closed."):format(x.id, x.tank))
+end
+
+-- signed move: > 0 drains the hatch, < 0 fills it; returns the signed amount moved. Own tank first,
+-- the interface when the tank is full (drain) or empty (fill). x.tank tracks the private tank exactly:
+-- nothing else touches it.
 local function move(x, amount)
-  local from, to = x.h, x.me
-  if amount < 0 then from, to, amount = x.me, x.h, -amount end
-  local ok, n = x.t.transferFluid(from, to, amount)
-  n = ok and n or 0
-  return from == x.h and n or -n
+  if amount > 0 then
+    local n = xfer(x, x.h, x.tk, amount)
+    x.tank = x.tank + n
+    if n < amount then n = n + xfer(x, x.h, x.me, amount - n) end
+    return n
+  end
+  local want, n = -amount, 0
+  if x.tank > 0 then
+    local ask = math.min(want, x.tank)
+    n = xfer(x, x.tk, x.h, ask)
+    x.tank = x.tank - n
+    if n < ask then
+      x.tank = x.t.getTankLevel(x.tk)
+      if x.tank > 0 then refused(x); return -n end
+    end
+  end
+  if n < want then n = n + xfer(x, x.me, x.h, want - n) end
+  return -n
 end
 
 local L, pending, pendingAt, sendAt -- level in effect; next level, when it was sent/received, when to send
 local master, masterAddr, lastL, target, lastT, maxL = false, nil, nil, nil, -math.huge, nil
-local bank, produced, absd, noise, dry, dryCount, dryUntil, cycles = 0, 0, 0, 0, false, 0, 0, 0
+local noise, absd, short, cycles, drops, dryUntil = 0, 0, 0, 0, 0, 0
 local lastCycle, lastQuiet, lastBeat, statusDue, sinceL = -math.huge, uptime(), 0, false, math.huge
-local reported, tankMin, tanks, nextTank = true, 0, {}, 0 -- lowest interface tank; master: per unit
-local why, lastShort = "starting", -math.huge
+local reported, nextHk, applied, why = true, 0, 0, "starting"
+local units = {} -- master: latest report per unit computer
 
 local function setLevel(v)
   if v ~= L then sinceL = uptime() end
+  if L and v > L then applied = applied + v - L end -- total of all rises, to age the tank reports
   L = v
 end
+
+-- A private tank keeps at least `low` after every rise. A hatch whose interface AE2 starves lives on its
+-- own production, which beats the per-cycle swing by only ~0.2 sigma; from `low` it runs empty with
+-- probability ~exp(-0.4 low/sigma). 16 average swings is ~13 sigma, about 0.5%.
+local function low() return math.max(2, math.ceil(16 * noise)) end
 
 -- Called when a hatch changed without us touching it (the forge ran a cycle), or every 1.5 s if
 -- nothing changes. Every computer switches to a new level at the first cycle it notices after the level
@@ -110,60 +141,48 @@ local function onCycle()
   local now = uptime()
   if now - lastCycle < 0.5 then return end -- several hatches changing in one cycle count once
   lastCycle = now
-  -- A hatch still below the level at the cycle start means its interface couldn't fund the fill (1 L
-  -- short is free: the forge drains half of the difference, rounded down). Skip the cycle right after a
-  -- level change: the fills may not have had a full window.
+  local sample = absd / #hatches -- average change per hatch in the cycle before
+  noise = noise == 0 and sample or noise * 0.9 + sample * 0.1
+  absd = 0
+  -- A hatch still below the level at the cycle start couldn't be filled (1 L short is free: the forge
+  -- drains half of the difference, rounded down). Skip the cycle right after a level change: the fills
+  -- may not have had a full window.
   if L and now - sinceL > 1.5 then
-    for _, x in ipairs(hatches) do
-      if x.last < L - 1 then
-        dry = true
-        if now - lastShort > 10 then
-          lastShort = now
-          note(("%s: hatch short at the cycle start (%d of %d L), its interface holds %d L")
-            :format(x.id, x.last, L, x.tank or -1))
-        end
-      end
-    end
+    for _, x in ipairs(hatches) do short = math.max(short, L - x.last) end
   end
-  local before = L
   if pending and pendingAt and now > pendingAt then setLevel(pending); pending, pendingAt = nil, nil end
   reported = false
-  if master then
-    bank, produced = bank + produced, 0
-    noise = noise * 0.9 + absd * 16 / #hatches * 0.1 -- average swing of all 16 hatches per cycle
-    local reserve = math.max(math.floor(2 * math.sqrt(16 * L)), math.floor(3 * noise))
-    maxL = (target and now - lastT < 30) and math.floor(target / 16) or L -- no brain: hold
-    -- A rise needs SHARE fills from every interface tank on top of this cycle's noise. Tank readings
-    -- can be a cycle old, so the rise that starts now and the one before it may still be owed.
-    local poorest = tankMin
-    for addr, t in pairs(tanks) do
-      if now - t[2] < 2.5 then poorest = math.min(poorest, t[1]) else tanks[addr] = nil end
-    end
-    poorest = poorest - 2 * SHARE * math.max(0, L - (before or L))
-    local up = math.min(step, math.floor(poorest / SHARE - 3 * noise / 16))
-    if L < 1 then up = 1 end -- an empty forge makes nothing; 1 L in whichever hatches can get it starts it
-    -- why the level isn't rising, for the brain's status line
-    if not (target and now - lastT < 30) then why = "holding: no target from the brain"
-    elseif L >= maxL then why = "at target"
-    elseif up <= 0 then why = ("waiting for interface tanks (poorest %d L)"):format(math.max(0, poorest))
-    elseif bank - reserve < 16 then why = ("saving production (%d of %d L)"):format(bank, reserve + 16)
-    else why = "rising" end
-    if dry and cycles >= dryUntil then why = "a hatch was short: lowering to refill ME" end
-    if dry and cycles >= dryUntil then
-      -- ME ran dry (the float was taken, or a power loss voided 10%): the level is no longer funded
-      -- and every short fill costs the imbalance penalty. Drop it once so the drains rebuild the float;
-      -- the next 3 cycles' dry reports are from before the drop took effect.
-      pending = math.min(maxL, math.max(1, L - math.min(step, math.ceil(3 * reserve / 16))))
-      bank, dryCount, dryUntil = reserve, dryCount + 1, cycles + 3
-    else
-      pending, bank = nextLevel(L, maxL, bank, reserve, up, step)
-    end
-    -- The cycle happened after the last reading that showed no change.
-    pendingAt, sendAt, dry = nil, lastQuiet + 0.5, false
-    cycles = cycles + 1
-    if cycles % 30 == 0 then statusDue = true end
+  if not master then return end
+
+  maxL = (target and now - lastT < 30) and math.floor(target / 16) or L -- no brain: hold
+  local room, worst, stale = math.huge, 0, nil
+  for addr, u in pairs(units) do
+    if now - u.at > 2.5 then stale = addr:sub(1, 8) end
+    room = math.min(room, u.room - (applied - u.applied)) -- rises since the report haven't been paid yet
+    worst = math.max(worst, u.short)
+    u.short = 0
   end
-  absd = 0
+  if worst > 1 and cycles >= dryUntil then
+    -- A hatch's private tank and its interface were both empty. Lower `low` below that hatch: it drains
+    -- `low` into its own tank, which covers its next bad cycles, and every other hatch drains into its
+    -- own tank, so nothing more is lost. The next 3 cycles' reports are from before the drop.
+    pending = math.max(0, L - math.min(step, worst + low()))
+    drops, dryUntil = drops + 1, cycles + 3
+    why = "a hatch couldn't be filled: lowered to it"
+  elseif L > maxL then
+    pending = math.max(maxL, L - step)
+    why = "lowering to target"
+  else
+    local up = math.max(0, math.min(step, maxL - L, stale and 0 or math.floor(room)))
+    if L < 1 and maxL >= 1 then up = 1 end -- an empty forge makes nothing; 1 L where it can be had starts it
+    pending = L + up
+    why = L >= maxL and "at target" or up > 0 and "rising"
+      or stale and ("waiting for unit " .. stale .. " to report")
+      or ("waiting for private tanks (poorest has %d L to spare)"):format(math.max(0, math.floor(room)))
+  end
+  pendingAt, sendAt = nil, lastQuiet + 0.5 -- the cycle happened after the last reading without a change
+  cycles = cycles + 1
+  if cycles % 30 == 0 then statusDue = true end
 end
 
 local function sendLevel()
@@ -173,23 +192,35 @@ local function sendLevel()
   end
 end
 
-local function onMessage(from, port, kind, v, flag, tank, level)
+local function onMessage(from, port, kind, a, b, c, d)
   local now = uptime()
   if port == WPORT and kind == "T" then
-    target, lastT, brain = v, now, from
+    target, lastT, brain = a, now, from
   elseif port == PORT and (kind == "L" or kind == "H") then -- level / heartbeat with the current level
     if master and from > self then return end -- the higher one steps down when it hears us
     if master or not masterAddr or from <= masterAddr or now - lastL > 2.5 then
       master, masterAddr, lastL = false, from, now
-      if not L then setLevel(v) elseif kind == "L" and v ~= pending then pending, pendingAt = v, now end
+      if not L then setLevel(a) elseif kind == "L" and a ~= pending then pending, pendingAt = a, now end
     end
-  elseif port == PORT and kind == "d" then
-    if not L then setLevel(level) end -- just rebooted: the others know the level our hatches drifted from
-    if master then
-      bank = bank + v
-      dry = dry or flag
-      tanks[from] = { tank, now }
-    end
+  elseif port == PORT and kind == "d" then -- unit report: room, short, level, private tank total
+    if not L then setLevel(c) end -- just rebooted: the others know the level our hatches drifted from
+    if master then units[from] = { room = a, short = b, spare = d, applied = applied, at = now } end
+  end
+end
+
+-- One hatch per idle pass: keep its private tank between 2 and 4 times `low`. The excess goes into the
+-- interface (straight into ME: that's your output); a shortfall is pulled from the interface.
+local function housekeep()
+  nextHk = nextHk % #hatches + 1
+  local x, now, lo = hatches[nextHk], uptime(), low()
+  if now - (x.readAt or 0) > 10 then -- resync now and then, in case someone touched the tank
+    x.tank, x.readAt = x.t.getTankLevel(x.tk), now
+  elseif x.tank > 4 * lo then
+    x.tank = x.tank - xfer(x, x.tk, x.me, math.min(step, x.tank - 2 * lo))
+  elseif x.tank < 2 * lo and now >= (x.pullAt or 0) then
+    local n = xfer(x, x.me, x.tk, math.min(step, 2 * lo - x.tank))
+    x.tank = x.tank + n
+    if n == 0 then x.pullAt = now + 1 end -- interface empty: don't spend a tick on it every pass
   end
 end
 
@@ -199,73 +230,61 @@ while true do
     local a = x.t.getTankLevel(x.h)
     if a ~= x.last then
       onCycle()
-      produced = produced + a - x.last
       absd = absd + math.abs(a - x.last)
     else
       lastQuiet = uptime()
     end
     if L and a ~= L then
       local moved = move(x, a - L)
-      if a < L and moved == 0 and uptime() - (x.warned or -math.huge) > 10 then
-        -- a refused fill with antimatter in the interface means the hatch's front input got switched off
-        local have = x.t.getTankLevel(x.me)
-        if have >= L - a then
-          x.warned = uptime()
-          note(("%s: HATCH REFUSED A FILL with %d L in its interface. Its front input got switched off: "
-            .. "screwdriver it until chat says 'Front face input enabled', and keep its GUI closed."):format(x.id, have))
-        end
-      end
       a = a - moved
-      busy = busy or moved ~= 0 -- a stuck hatch (ME empty/full) must not block messages
+      busy = busy or moved ~= 0 -- a hatch that can't be filled must not block messages
     end
     x.last = a
     sendLevel()
   end
 
-  if not busy then -- spare ticks: elect, read one interface tank, report, read messages
+  if not busy then -- spare ticks: elect, keep the tanks, report, read messages
     local now = uptime()
     if now - lastCycle > 1.5 then onCycle() end -- forge empty or stopped: levels still have to move
     if not master and now - born > 2.5 and (not lastL or now - lastL > 2.5) then
-      master, masterAddr, pending, pendingAt, bank = true, self, nil, nil, 0
+      master, masterAddr, pending, pendingAt = true, self, nil, nil
       if not L then
         local lo = math.huge
         for _, x in ipairs(hatches) do lo = math.min(lo, x.last) end
         setLevel(lo)
       end
     end
-    if L then -- one tank per pass: reading all of them at once delays the balancing
-      nextTank = nextTank % #hatches + 1
-      local x = hatches[nextTank]
-      x.tank = x.t.getTankLevel(x.me)
-      tankMin = math.huge
-      for _, y in ipairs(hatches) do tankMin = math.min(tankMin, y.tank or 0) end
-    end
+    if L then housekeep() end
     if L and not reported then -- once per cycle, after this cycle's fills
       reported = true
-      if master then
-        bank, produced = bank + produced, 0
-      elseif masterAddr then
-        modem.send(masterAddr, PORT, "d", produced, dry, tankMin, L)
-        produced, dry = 0, false
+      local room, spare, lo = math.huge, 0, low()
+      for _, x in ipairs(hatches) do
+        room, spare = math.min(room, x.tank - lo), spare + x.tank
       end
+      if master then
+        units[self] = { room = room, short = short, spare = spare, applied = applied, at = now }
+      elseif masterAddr then
+        modem.send(masterAddr, PORT, "d", room, short, L, spare)
+      end
+      short = 0
     end
     if master then
-      bank, produced = bank + produced, 0
       if now - lastBeat > 1.5 then
         modem.broadcast(PORT, "H", L)
         lastBeat = now
       end
       if statusDue and brain then
+        local spare = 0
+        for _, u in pairs(units) do spare = spare + u.spare end
         modem.setStrength(400)
-        modem.send(brain, WPORT, "status", L, maxL and maxL * 16 or -1, bank, dryCount, why)
-        dryCount = 0 -- report drops per status period, not since boot
+        modem.send(brain, WPORT, "status", L, maxL and maxL * 16 or -1, spare, drops, why)
         modem.setStrength(0)
-        statusDue = false
+        statusDue, drops = false, 0
       end
     end
     repeat
-      local ev, _, from, port, _, kind, v, flag, tank, level = computer.pullSignal(0)
-      if ev == "modem_message" then onMessage(from, port, kind, v, flag, tank, level) end
+      local ev, _, from, port, _, kind, a, b, c, d = computer.pullSignal(0)
+      if ev == "modem_message" then onMessage(from, port, kind, a, b, c, d) end
     until not ev
   end
 end
