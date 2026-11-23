@@ -206,6 +206,15 @@ while true do
     end
     if L and a ~= L then
       local moved = move(x, a - L)
+      if a < L and moved == 0 and uptime() - (x.warned or -math.huge) > 10 then
+        -- a refused fill with antimatter in the interface means the hatch's front input got switched off
+        local have = x.t.getTankLevel(x.me)
+        if have >= L - a then
+          x.warned = uptime()
+          note(("%s: HATCH REFUSED A FILL with %d L in its interface. Its front input got switched off: "
+            .. "screwdriver it until chat says 'Front face input enabled', and keep its GUI closed."):format(x.id, have))
+        end
+      end
       a = a - moved
       busy = busy or moved ~= 0 -- a stuck hatch (ME empty/full) must not block messages
     end
